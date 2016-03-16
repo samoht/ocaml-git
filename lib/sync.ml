@@ -582,20 +582,28 @@ module Make (IO: IO) (Store: Store.S) = struct
       | Ack of Hash.t
       | Nak
 
-    let input ic =
-      Log.debug (fun l -> l "Ack.input");
-      PacketLine.input ic >>= function
-      | None
-      | Some "NAK" -> Lwt.return Nak
-      | Some s      ->
+    type state = Return of t
+
+    let handle state line =
+      match state, line with
+      | _, (Some "NAK"
+           | None)  -> Ok (Return Nak, [])
+      | _, Some s   ->
         match String.cut s ~sep:Misc.sp_str with
         | Some ("ACK", r) ->
           begin match String.cut r ~sep:Misc.sp_str with
-            | None         -> Lwt.return (Ack (Hash_IO.of_hex r))
+            | None         ->  Ok (Return (Ack (Hash_IO.of_hex r)), [])
             | Some (id, s) ->
-              Lwt.return (Ack_multi (Hash_IO.of_hex id, status_of_string s))
+              Ok (Return (Ack_multi (Hash_IO.of_hex id, status_of_string s)), [])
           end
         | _ -> error "%S invalid ack" s
+
+    let input ic =
+      Log.debug (fun l -> l "Ack.input");
+      PacketLine.input ic >>= fun line ->
+      match handle (Return Nak) line with
+      | Error e          -> Lwt.fail_with e
+      | Ok (Return r, _) -> Lwt.return r
 
     let _inputs ic =
       Log.debug (fun l -> l "Ack.inputs");
