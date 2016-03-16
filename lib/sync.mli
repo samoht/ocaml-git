@@ -63,11 +63,9 @@ module Result: sig
   val pp_fetch: fetch Fmt.t
   (** [pp_fetch] is the pretty-printer for {!fetch} values. *)
 
-  type ok_or_error = [`Ok | `Error of string]
-
   type push = {
-    result  : ok_or_error;
-    commands: (Reference.t * ok_or_error) list;
+    result  : (unit, string) Result.result;
+    commands: (Reference.t * (unit, string) Result.result) list;
   }
   (** The result of a push operation. *)
 

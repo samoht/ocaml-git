@@ -15,6 +15,7 @@
  *)
 
 open Astring
+open Rresult
 open Lwt.Infix
 
 module Log = (val Misc.src_log "sync" : Logs.LOG)
@@ -280,17 +281,15 @@ module Result = struct
       ) (references t);
     Fmt.pf ppf "Keys: %d\n" (Hash.Set.cardinal t.hashes)
 
-  type ok_or_error = [ `Ok | `Error of string ]
-
   type push = {
-    result: ok_or_error;
-    commands: (Reference.t * ok_or_error) list;
+    result  : (unit, string) result;
+    commands: (Reference.t * (unit, string) result) list;
   }
 
   let pp_push ppf t =
     let aux (r, result) = match result with
-      | `Ok      -> Fmt.pf ppf "* %a\n" Reference.pp r
-      | `Error e -> Fmt.pf ppf "! %a: %s\n" Reference.pp r e
+      | Ok ()   -> Fmt.pf ppf "* %a\n" Reference.pp r
+      | Error e -> Fmt.pf ppf "! %a: %s\n" Reference.pp r e
     in
     List.iter aux t.commands
 
@@ -300,14 +299,12 @@ module Make (IO: IO) (Store: Store.S) = struct
 
   module Hash_IO = Hash.IO(Store.Digest)
 
-  exception Error
-
   type ctx = IO.ctx
 
   let error fmt =
     Printf.ksprintf (fun msg ->
         Log.err (fun l -> l "%s" msg);
-        raise Error
+         failwith msg
       ) fmt
 
   let err_invalid_integer fn str =
@@ -826,8 +823,6 @@ module Make (IO: IO) (Store: Store.S) = struct
       | 3 -> Fatal
       | i -> error "Side_band: %d is not a valid message type" i
 
-    exception Error of string
-
     let input ?(progress=fun _ -> ()) ic =
       Log.debug (fun l -> l "Side_band.input");
       let size = ref 0 in
@@ -853,7 +848,7 @@ module Make (IO: IO) (Store: Store.S) = struct
           pp payload;
           match kind s.[0] with
           | Pack     -> aux (payload :: acc)
-          | Fatal    -> Lwt.fail (Error payload)
+          | Fatal    -> Lwt.fail_with payload
           | Progress ->
             let payload = "remote: " ^ payload in
             Log.info (fun l -> l "%s" payload);
@@ -955,8 +950,8 @@ module Make (IO: IO) (Store: Store.S) = struct
       | None -> Lwt.fail (Failure "Report_status.input: empty")
       | Some line ->
         begin match String.cut line ~sep:Misc.sp_str with
-          | Some ("unpack", "ok") -> Lwt.return `Ok
-          | Some ("unpack", err ) -> Lwt.return (`Error err)
+          | Some ("unpack", "ok") -> Lwt.return (Ok ())
+          | Some ("unpack", err ) -> Lwt.return (Error err)
           | _ -> Lwt.fail (Failure "Report_status.input: unpack-status")
         end >>= fun result ->
         let aux acc =
@@ -965,12 +960,12 @@ module Make (IO: IO) (Store: Store.S) = struct
           | Some line ->
             match String.cut line ~sep:Misc.sp_str with
             | Some ("ok", name)  ->
-              Lwt.return ((Reference.of_raw name, `Ok) :: acc)
+              Lwt.return ((Reference.of_raw name, Ok ()) :: acc)
             | Some ("ng", cont)  ->
               begin match String.cut cont ~sep:Misc.sp_str with
                 | None  -> Lwt.fail (Failure "Report_status.input: command-fail")
                 | Some (name, err) ->
-                  Lwt.return ((Reference.of_raw name, `Error err) :: acc)
+                  Lwt.return ((Reference.of_raw name, Error err) :: acc)
               end
             | _ -> Lwt.fail (Failure "Report_status.input: command-status")
         in
