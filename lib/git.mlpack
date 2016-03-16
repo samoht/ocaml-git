@@ -1,6 +1,5 @@
 # OASIS_START
-# DO NOT EDIT (digest: cce59428718c5644081f6e5f17da1492)
-Misc
+# DO NOT EDIT (digest: bbc8dfd2587e764bd5cbb36166c1d51e)
 Hash
 Inflate
 Object
@@ -16,8 +15,6 @@ Pack_index
 Packed_value
 Packed_refs
 Index
-Sync
-Gri
 Search
 Global_graph
 User
@@ -25,5 +22,7 @@ Store
 Memory
 FS
 Version
+Sync
 LRU
+Misc
 # OASIS_STOP

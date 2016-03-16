@@ -18,7 +18,14 @@ open Astring
 open Rresult
 open Lwt.Infix
 
-module Log = (val Misc.src_log "sync" : Logs.LOG)
+module Log = (val Misc.src_log "Git.Sync" : Logs.LOG)
+
+let err fmt = Fmt.kstrf failwith fmt
+let err_unknkown () = err "Unknown Git protocol"
+let err_not_supported x = err "%s is not a supported Git protocol" x
+let err_unknown_tag t = err "%a: unknown tag" Reference.pp t
+
+let ogit_agent = "git/ogit." ^ Version.current
 
 type protocol = [ `SSH | `Git | `Smart_HTTP ]
 
@@ -29,11 +36,6 @@ let protocol uri = match Uri.scheme uri with
   | Some "https"   -> `Ok `Smart_HTTP
   | Some x -> `Not_supported x
   | None   -> `Unknown
-
-let err fmt = Fmt.kstrf failwith fmt
-let err_unknkown () = err "Unknown Git protocol"
-let err_not_supported x = err "%s is not a supported Git protocol" x
-let err_unknown_tag t = err "%a: unknown tag" Reference.pp t
 
 let protocol_exn uri = match protocol uri with
   | `Ok x            -> x
@@ -63,19 +65,101 @@ let is_head = has_prefix "refs/heads/"
 let is_tag  = has_prefix "refs/tags/"
 let is_head_or_tag r = is_head r || is_tag r
 
-module type IO = sig
-  type ic
-  type oc
-  type ctx
-  val with_connection: ?ctx:ctx -> Uri.t -> ?init:string ->
-    (ic * oc -> 'a Lwt.t) -> 'a Lwt.t
-  val read_all: ic -> string list Lwt.t
-  val read_exactly: ic -> int -> string Lwt.t
-  val write: oc -> string -> unit Lwt.t
-  val flush: oc -> unit Lwt.t
-end
+module Init = struct
+  let err fmt = Fmt.kstrf invalid_arg ("Init: " ^^ fmt)
 
-let ogit_agent = "git/ogit." ^ Version.current
+  type request =
+    | Upload_pack
+    | Receive_pack
+    | Upload_archive
+
+  let string_of_request = function
+    | Upload_pack    -> "git-upload-pack"
+    | Receive_pack   -> "git-receive-pack"
+    | Upload_archive -> "git-upload-archive"
+
+  let pp_request = Fmt.of_to_string string_of_request
+
+  type t = {
+    request: request;
+    discover: bool; (* The smart HTTP protocol has 2 modes. *)
+    gri: Gri.t;
+  }
+
+  let host t = Uri.host (Gri.to_uri t.gri)
+  let uri t = Gri.to_uri t.gri
+
+  (* Initialisation sentence for the Git protocol *)
+  let git t =
+    let uri = Gri.to_uri t.gri in
+    let message =
+      let buf = Buffer.create 1024 in
+      let path = match Uri.path uri with "" -> "/" | p  -> p in
+      Buffer.add_string buf (string_of_request t.request);
+      Buffer.add_char   buf Misc.sp;
+      Buffer.add_string buf path;
+      Buffer.add_char   buf Misc.nul;
+      begin match Uri.host uri with
+        | None   -> ()
+        | Some h ->
+          Buffer.add_string buf "host=";
+          Buffer.add_string buf h;
+          begin match Uri.port uri with
+            | None   -> ()
+            | Some p ->
+              Buffer.add_char   buf ':';
+              Buffer.add_string buf (Printf.sprintf "%d" p);
+          end;
+          Buffer.add_char buf Misc.nul;
+      end;
+      Buffer.contents buf in
+    let size = Printf.sprintf "%04x" (4 + String.length message) in
+    Printf.sprintf "%s%s" size message
+
+  let ssh t =
+    Printf.sprintf "%s %s" (string_of_request t.request)
+      (Uri.path (Gri.to_uri t.gri))
+
+  let smart_http t =
+    (* Note: GitHub wants User-Agent to start by `git/`  *)
+    let useragent = "User-Agent", ogit_agent in
+    let headers : (string * string) list =
+      if t.discover
+      then [useragent]
+      else [
+        useragent;
+        "Content-Type", Printf.sprintf "application/x-%s-request"
+          (string_of_request t.request);
+      ]
+    in
+    Marshal.to_string headers []
+
+  let to_string t =
+    match protocol_exn (Gri.to_uri t.gri) with
+    | `Git -> Some (git t)
+    | `SSH -> Some (ssh t)
+    | `Smart_HTTP -> Some (smart_http t)
+
+  let create request ~discover gri =
+    Log.debug (fun l ->
+        l "Init.create request=%a discover=%b gri=%s"
+          pp_request request discover (Gri.to_string gri));
+    let protocol = protocol_exn (Gri.to_uri gri) in
+    let gri = match protocol with
+      | `SSH | `Git -> gri
+      | `Smart_HTTP ->
+        let service = if discover then "info/refs?service=" else "" in
+        let url = Gri.to_string gri in
+        let request = string_of_request request in
+        Gri.of_string (Printf.sprintf "%s/%s%s" url service request)
+    in
+    Log.debug (fun l -> l "computed-gri: %s" (Gri.to_string gri));
+    { request; discover; gri }
+
+  let upload_pack = create Upload_pack
+  let receive_pack = create Receive_pack
+  let _upload_archive = create Upload_archive
+end
 
 module Capability = struct
 
@@ -196,6 +280,16 @@ module Listing = struct
     references  : Hash.t Reference.Map.t;
   }
 
+  let pp ppf t =
+    Fmt.pf ppf "CAPABILITIES:\n%a\n" Capabilities.pp t.capabilities;
+    Fmt.pf ppf "\nREFERENCES:\n";
+    Hash.Map.iter
+      (fun key data ->
+         List.iter (fun r ->
+             Fmt.pf ppf "%a %a\n" Hash.pp key Reference.pp r
+           ) data
+      ) t.hashes
+
   let capabilities t = t.capabilities
   let references t = t.references
   let hashes t = t.hashes
@@ -216,16 +310,6 @@ module Listing = struct
     try Hash.Map.find c t.hashes
     with Not_found -> []
 
-  let pp ppf t =
-    Fmt.pf ppf "CAPABILITIES:\n%a\n" Capabilities.pp t.capabilities;
-    Fmt.pf ppf "\nREFERENCES:\n";
-    Hash.Map.iter
-      (fun key data ->
-         List.iter (fun r ->
-             Fmt.pf ppf "%a %a\n" Hash.pp key Reference.pp r
-           ) data
-      ) t.hashes
-
   let guess_reference t c =
     let heads = Hash.Map.find c t.hashes |> List.filter is_head in
     match heads with
@@ -242,6 +326,10 @@ module Listing = struct
       Some r
 
 end
+
+
+
+
 
 module Result = struct
 
@@ -295,26 +383,33 @@ module Result = struct
 
 end
 
+module type IO = sig
+  type ic
+  type oc
+  type ctx
+  val with_connection: ?ctx:ctx -> Uri.t -> ?init:string ->
+    (ic * oc -> 'a Lwt.t) -> 'a Lwt.t
+  val read_all: ic -> string list Lwt.t
+  val read_exactly: ic -> int -> string Lwt.t
+  val write: oc -> string -> unit Lwt.t
+  val flush: oc -> unit Lwt.t
+end
+
 module Make (IO: IO) (Store: Store.S) = struct
 
   module Hash_IO = Hash.IO(Store.Digest)
 
   type ctx = IO.ctx
 
-  let error fmt =
-    Printf.ksprintf (fun msg ->
-        Log.err (fun l -> l "%s" msg);
-         failwith msg
-      ) fmt
-
-  let err_invalid_integer fn str =
-    error "%s: %S is not a valid integer" fn str
+  let err_invalid_integer fn str = err "%s: %S is not a valid integer" fn str
 
   let err_end_of_file () =
-    err "The connection has been closed by the server. This is usually due \
-         to an invalid client request."
+    err  "The connection has been closed by the server. This is usually due \
+          to an invalid client request."
 
   module PacketLine = struct
+
+    let err fmt = Fmt.kstrf invalid_arg ("PacketLine: " ^^ fmt)
 
     type t = string option
 
@@ -347,7 +442,7 @@ module Make (IO: IO) (Store: Store.S) = struct
       output oc None
 
     let err_no_trailing_lf () =
-      error "PacketLine.input: the payload doesn't have a trailing LF"
+      err "PacketLine.input: the payload doesn't have a trailing LF"
 
     let truncate s =
       if String.length s > 100 then
@@ -366,7 +461,7 @@ module Make (IO: IO) (Store: Store.S) = struct
         let size =
           let str = "0x" ^ size in
           try int_of_string str - 4
-          with Failure _ -> err_invalid_integer "PacketLine.input" str
+          with Failure _ -> err "PacketLine.input" str
         in
         IO.read_exactly ic size >>= fun payload ->
         Log.debug (fun l -> l "RECEIVED: %s (%d)"  (truncate payload) size);
@@ -394,102 +489,11 @@ module Make (IO: IO) (Store: Store.S) = struct
 
   end
 
-  module Init = struct
-
-    type request =
-      | Upload_pack
-      | Receive_pack
-      | Upload_archive
-
-    let string_of_request = function
-      | Upload_pack    -> "git-upload-pack"
-      | Receive_pack   -> "git-receive-pack"
-      | Upload_archive -> "git-upload-archive"
-
-    let pp_request = Fmt.of_to_string string_of_request
-
-    type t = {
-      request: request;
-      discover: bool; (* The smart HTTP protocol has 2 modes. *)
-      gri: Gri.t;
-    }
-
-    let host t = Uri.host (Gri.to_uri t.gri)
-    let uri t = Gri.to_uri t.gri
-
-    (* Initialisation sentence for the Git protocol *)
-    let git t =
-      let uri = Gri.to_uri t.gri in
-      let message =
-        let buf = Buffer.create 1024 in
-        let path = match Uri.path uri with "" -> "/" | p  -> p in
-        Buffer.add_string buf (string_of_request t.request);
-        Buffer.add_char   buf Misc.sp;
-        Buffer.add_string buf path;
-        Buffer.add_char   buf Misc.nul;
-        begin match Uri.host uri with
-          | None   -> ()
-          | Some h ->
-            Buffer.add_string buf "host=";
-            Buffer.add_string buf h;
-            begin match Uri.port uri with
-              | None   -> ()
-              | Some p ->
-                Buffer.add_char   buf ':';
-                Buffer.add_string buf (Printf.sprintf "%d" p);
-            end;
-            Buffer.add_char buf Misc.nul;
-        end;
-        Buffer.contents buf in
-      PacketLine.string_of_line message
-
-    let ssh t =
-      Printf.sprintf "%s %s" (string_of_request t.request)
-        (Uri.path (Gri.to_uri t.gri))
-
-    let smart_http t =
-      (* Note: GitHub wants User-Agent to start by `git/`  *)
-      let useragent = "User-Agent", ogit_agent in
-      let headers : (string * string) list =
-        if t.discover
-        then [useragent]
-        else [
-          useragent;
-          "Content-Type", Printf.sprintf "application/x-%s-request"
-            (string_of_request t.request);
-        ]
-      in
-      Marshal.to_string headers []
-
-    let to_string t =
-      match protocol_exn (Gri.to_uri t.gri) with
-      | `Git -> Some (git t)
-      | `SSH -> Some (ssh t)
-      | `Smart_HTTP -> Some (smart_http t)
-
-    let create request ~discover gri =
-      Log.debug (fun l ->
-          l "Init.create request=%a discover=%b gri=%s"
-            pp_request request discover (Gri.to_string gri));
-      let protocol = protocol_exn (Gri.to_uri gri) in
-      let gri = match protocol with
-        | `SSH | `Git -> gri
-        | `Smart_HTTP ->
-          let service = if discover then "info/refs?service=" else "" in
-          let url = Gri.to_string gri in
-          let request = string_of_request request in
-          Gri.of_string (Printf.sprintf "%s/%s%s" url service request)
-      in
-      Log.debug (fun l -> l "computed-gri: %s" (Gri.to_string gri));
-      { request; discover; gri }
-
-    let upload_pack = create Upload_pack
-    let receive_pack = create Receive_pack
-    let _upload_archive = create Upload_archive
-  end
 
 
   module Listing = struct
+
+    let err fmt = Fmt.kstrf invalid_arg ("Listing: " ^^ fmt)
 
     include Listing
 
@@ -499,30 +503,25 @@ module Make (IO: IO) (Store: Store.S) = struct
       | Read of Listing.t
       | Return of Listing.t
 
-    let error fmt =
-      Fmt.kstrf
-        (fun str -> Error str)
-        ("[SMART-HTTP] Listing.input:" ^^ fmt)
-
-    let handle state line =
+    let client_handler state line =
       match state, line with
-      | HeaderService, None   -> error "missing # header."
+      | HeaderService, None   -> err "missing # header."
       | HeaderService, Some l ->
         begin match String.cut l ~sep:Misc.sp_str with
           | Some ("#", service) ->
             Log.debug (fun l -> l "skipping %s" service);
-            Ok (HeaderFlush, [])
-          | Some _ -> error "waiting for # header, got %S" l
-          | None   -> error "waiting for # header, got pkt-flush"
+            HeaderFlush, []
+          | Some _ -> err "waiting for # header, got %S" l
+          | None   -> err "waiting for # header, got pkt-flush"
         end
-      | HeaderFlush, None   -> Ok (Read Listing.empty, [])
-      | HeaderFlush, Some x -> error "waiting for pkt-flush, got %S" x
-      | Return _   , _      -> error "listing in final state"
-      | Read acc   , None   -> Ok (Return acc, [])
+      | HeaderFlush, None   -> Read Listing.empty, []
+      | HeaderFlush, Some x -> err "waiting for pkt-flush, got %S" x
+      | Return _   , _      -> err "listing in final state"
+      | Read acc   , None   -> Return acc, []
       | Read acc   , Some l ->
         match String.cut l ~sep:Misc.sp_str with
-        | Some ("ERR", err) -> error "ERROR: %s" err
-        | Some (h, r)  ->
+        | Some ("ERR", e) -> err "ERROR: %s" e
+        | Some (h, r)     ->
           let h = Hash_IO.Commit.of_hex h in
           if is_empty acc then (
             (* Read the capabilities on the first line *)
@@ -533,20 +532,20 @@ module Make (IO: IO) (Store: Store.S) = struct
               let hashes = Hash.Map.add_multi h r acc.hashes in
               let references = Reference.Map.add r h acc.references in
               let capabilities = Capabilities.of_string caps in
-              Ok (Read { hashes; capabilities; references }, [])
+              Read { hashes; capabilities; references }, []
             | None ->
               let r = Reference.of_raw r in
               let h = Hash.of_commit h in
               let hashes = Hash.Map.add_multi h r acc.hashes in
               let references = Reference.Map.add r h acc.references in
-              Ok (Read { hashes; references; capabilities = [] }, [])
+              Read { hashes; references; capabilities = [] }, []
           ) else
             let r = Reference.of_raw r in
             let h = Hash.of_commit h in
             let hashes = Hash.Map.add_multi h r acc.hashes in
             let references = Reference.Map.add r h acc.references in
-            Ok (Read { acc with hashes; references }, [])
-        | None -> error "Listing.input: %S is not a valid answer" l
+            Read { acc with hashes; references }, []
+        | None -> err "Listing.input: %S is not a valid answer" l
 
     let input ic protocol =
       Log.debug (fun l -> l "Listing.input (protocol=%a)" pp_protocol protocol);
@@ -556,10 +555,9 @@ module Make (IO: IO) (Store: Store.S) = struct
       in
       let rec aux state =
         PacketLine.input ic >>= fun line ->
-        match handle state line  with
-        | Ok (Return f, _) -> Lwt.return f
-        | Ok (state   , _) -> aux state
-        | Error e          -> Lwt.fail_with e
+        match client_handler state line  with
+        | Return f, _ -> Lwt.return f
+        | state   , _ -> aux state
       in
       aux init
 
@@ -575,7 +573,7 @@ module Make (IO: IO) (Store: Store.S) = struct
       | "continue" -> Continue
       | "common"   -> Common
       | "ready"    -> Ready
-      | x          -> error "%s: invalid ack status" x
+      | x          -> err "%s: invalid ack status" x
 
     type t =
       | Ack_multi of Hash.t * status
@@ -587,23 +585,22 @@ module Make (IO: IO) (Store: Store.S) = struct
     let handle state line =
       match state, line with
       | _, (Some "NAK"
-           | None)  -> Ok (Return Nak, [])
+           | None)  -> Return Nak, []
       | _, Some s   ->
         match String.cut s ~sep:Misc.sp_str with
         | Some ("ACK", r) ->
           begin match String.cut r ~sep:Misc.sp_str with
-            | None         ->  Ok (Return (Ack (Hash_IO.of_hex r)), [])
+            | None         ->  Return (Ack (Hash_IO.of_hex r)), []
             | Some (id, s) ->
-              Ok (Return (Ack_multi (Hash_IO.of_hex id, status_of_string s)), [])
+              Return (Ack_multi (Hash_IO.of_hex id, status_of_string s)), []
           end
-        | _ -> error "%S invalid ack" s
+        | _ -> err "%S invalid ack" s
 
     let input ic =
       Log.debug (fun l -> l "Ack.input");
       PacketLine.input ic >>= fun line ->
       match handle (Return Nak) line with
-      | Error e          -> Lwt.fail_with e
-      | Ok (Return r, _) -> Lwt.return r
+      | Return r, _ -> Lwt.return r
 
     let _inputs ic =
       Log.debug (fun l -> l "Ack.inputs");
@@ -626,64 +623,127 @@ module Make (IO: IO) (Store: Store.S) = struct
       | Have of Hash.Commit.t
       | Done
 
-    type t = message list
+    let pp_message ppf = function
+      | Want (h, []) -> Fmt.pf ppf "want %a" Hash.Commit.pp h
+      | Want (h, cs) -> Fmt.pf ppf "want %a %a" Hash.Commit.pp h Capabilities.pp cs
+      | Shallow h    -> Fmt.pf ppf "want %a" Hash.pp h
+      | Deepen d     -> Fmt.pf ppf "deepend %d" d
+      | Unshallow h  -> Fmt.pf ppf "unshallow %a" Hash.pp h
+      | Have h       -> Fmt.pf ppf "have %a" Hash.Commit.pp h
+      | Done         -> Fmt.string ppf "done"
 
-    let filter fn l =
-      List.fold_left (fun acc elt ->
-          match fn elt with
-          | None   -> acc
-          | Some x -> x::acc
-        ) [] l
-      |> List.rev
+    let message_of_line line =
+      match String.cut line ~sep:Misc.sp_str with
+      | None -> err "input upload"
+      | Some (kind, s) ->
+        match kind with
+        | "shallow"   -> Shallow (Hash_IO.of_hex s)
+        | "unshallow" -> Unshallow (Hash_IO.of_hex s)
+        | "have"      -> Have (Hash_IO.Commit.of_hex s)
+        | "done"      -> Done
+        | "deepen"    ->
+          let d =
+            try int_of_string s
+            with Failure _ -> err_invalid_integer "Upload.input" s
+          in
+          Deepen d
+        | "want" ->
+          let want id c = Want (Hash_IO.Commit.of_hex id, c) in
+          begin match String.cut s ~sep:Misc.sp_str with
+            | Some (id,c) -> want id (Capabilities.of_string c)
+            | None        -> want s []
+          end
+        | s -> err "Upload.input: %S is not a valid upload request." s
 
-    let filter_wants l =
-      filter (function Want (x,y) -> Some (x,y) | _ -> None) l
+    type t = {
+      wants       : Hash.Commit.t list;
+      capabilities: Capability.t list;
+      shallows    : Hash.t list;
+      depth       : int option;
+    }
 
-    let filter_shallows l =
-      filter (function Shallow x -> Some x | _ -> None) l
+    let pp ppf t =
+      Fmt.(pf ppf "{ @[wants=[@[%a@]];@ \
+                   capabilities=[@[%a@]];@ \
+                   shallows=[@[%a@]];@ \
+                   depth=%a@] }"
+             (list Hash.Commit.pp) t.wants
+             (list Capability.pp) t.capabilities
+             (list Hash.pp) t.shallows
+             (option int) t.depth)
 
-    let filter_deepen l =
-      match filter (function Deepen d -> Some d | _ -> None) l with
-      | []    -> 0
-      |  i::_ -> i
+    let empty = { wants = []; capabilities = []; shallows = []; depth = None }
 
-    let filter_unshallows l =
-      filter (function Unshallow x -> Some x | _ -> None) l
+    type client_state =
+      | InitNegociation of t
 
-    let filter_haves l =
-      filter (function Have x -> Some x | _ -> None) l
+    let pp_client_state ppf = function
+      | InitNegociation t -> Fmt.pf ppf "InitNegociation %a" pp t
+
+    (* client-side handling of upload-request *)
+    let client_hanlder state line =
+      match state, line with
+      | InitNegociation t, None ->
+        begin match t.wants with
+          | []       -> err "missing first-want"
+          | w::wants ->
+            List.map (fun m -> Fmt.to_to_string pp_message m) (
+              Want (w, t.capabilities)
+              :: List.map (fun w -> Want (w, [])) wants
+              @  List.map (fun s -> Shallow s) t.shallows
+              @  (match t.depth with None -> [] | Some d -> [Deepen d])
+            )
+        end
+      | _ -> err "state %a: invalid input:%a"
+               pp_client_state state Fmt.(option string) line
+
+    type server_state =
+      | Read1stWant
+      | ReadWant of t
+      | ReadShallow of t
+      | ReadFlush of t
+      | ReadUnshallow of t
+      | Return of t
+
+    let pp_server_state ppf = function
+      | Read1stWant     -> Fmt.string ppf "Read1stWant"
+      | ReadWant t      -> Fmt.pf ppf "ReadWant %a" pp t
+      | ReadShallow t   -> Fmt.pf ppf "ReadShallow %a" pp t
+      | ReadFlush t     -> Fmt.pf ppf "ReadFlush %a" pp t
+      | ReadUnshallow t -> Fmt.pf ppf "ReadUnshallow %a" pp t
+      | Return t        -> Fmt.pf ppf "Return %a" pp t
+
+    (* For the server to hanlde an upload-request *)
+    let server_handler state line =
+      let open Rresult in
+      let msg = match line with
+        | None   -> None
+        | Some l -> Some (message_of_line l)
+      in
+      let read_want t w = ReadWant { t with wants = w :: t.wants }, [] in
+      let create c = { empty with capabilities = c } in
+      let read_shallow t s =
+        ReadShallow { t with shallows = s :: t.shallows }, []
+      in
+      let read_flush t d = ReadFlush { t with depth = Some d }, [] in
+      match state, msg with
+      | Read1stWant, Some (Want (w, c)) -> read_want (create c) w
+      | ReadWant t, Some (Want (w, [])) -> read_want t w
+      | (ReadWant t | ReadShallow t), Some (Shallow s) -> read_shallow t s
+      | (ReadWant t | ReadShallow t), Some (Deepen d) -> read_flush t d
+      | (ReadWant t | ReadShallow t | ReadFlush t), None -> Return t, []
+      | _ -> err "state %a: invalid input:\n%a\n"
+               pp_server_state state Fmt.(option pp_message) msg
 
     let input ic: t Lwt.t =
       Log.debug (fun l -> l "Upload.input");
-      let rec aux acc =
-        PacketLine.input_raw ic >>= function
-        | None   -> Lwt.return (List.rev acc)
-        | Some l ->
-          match String.cut l ~sep:Misc.sp_str with
-          | None -> error "input upload"
-          | Some (kind, s) ->
-            match kind with
-            | "shallow"   -> aux (Shallow (Hash_IO.of_hex s) :: acc)
-            | "unshallow" -> aux (Unshallow (Hash_IO.of_hex s) :: acc)
-            | "have"      -> aux (Have (Hash_IO.Commit.of_hex s) :: acc)
-            | "done"      -> aux (Done :: acc)
-            | "deepen"    ->
-              let d =
-                try int_of_string s
-                with Failure _ -> err_invalid_integer "Upload.input" s
-              in
-              aux (Deepen d :: acc)
-            | "want" ->
-              let aux id c = aux (Want (Hash_IO.Commit.of_hex id, c) :: acc) in
-              begin match String.cut s ~sep:Misc.sp_str with
-                | Some (id,c) -> aux id (Capabilities.of_string c)
-                | None        -> match acc with
-                  | Want (_,c)::_ -> aux s c
-                  | _             -> error "want without capacity"
-              end
-            | s -> error "Upload.input: %S is not a valid upload request." s
+      let rec aux state =
+        PacketLine.input_raw ic >>= fun line ->
+        match handle state line with
+        | Return t, _ -> Lwt.return t
+        | state   , _ -> aux state
       in
-      aux []
+      aux Read1stWant
 
     (* XXX: handle multi_hack *)
     let output oc t =
@@ -886,7 +946,7 @@ module Make (IO: IO) (Store: Store.S) = struct
 
     let input ~capabilities ?progress ic =
       if List.mem `Side_band_64k capabilities
-         || List.mem `Side_band capabilities
+      || List.mem `Side_band capabilities
       then Side_band.input ?progress ic
       else IO.read_all ic
 

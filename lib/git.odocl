@@ -1,6 +1,5 @@
 # OASIS_START
-# DO NOT EDIT (digest: 1a428607dbd2b5220591b751e469f794)
-Misc
+# DO NOT EDIT (digest: c98ccc2b78c38e943b18c0cfb282701b)
 Hash
 Inflate
 Object
@@ -16,8 +15,6 @@ Pack_index
 Packed_value
 Packed_refs
 Index
-Sync
-Gri
 Search
 Global_graph
 User
@@ -25,6 +22,7 @@ Store
 Memory
 FS
 Version
+Sync
 unix/Git_unix
 mirage/Git_mirage
 # OASIS_STOP

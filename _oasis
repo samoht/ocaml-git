@@ -19,12 +19,12 @@ Library git
   Pack:              true
   Path:              lib/
   Findlibname:       git
-  InternalModules:   LRU
-  Modules:           Misc, Hash, Inflate, Object, Object_type,
+  InternalModules:   LRU, Misc
+  Modules:           Hash, Inflate, Object, Object_type,
                      Blob, Tree, Commit, Tag, Reference, Value,
                      Pack, Pack_index, Packed_value, Packed_refs, Index,
-                     Sync, Gri, Search, Global_graph, User, Store,
-                     Memory, FS, Version
+                     Search, Global_graph, User, Store, Memory, FS, Version,
+                     Sync
   BuildDepends:      mstruct, logs, ocamlgraph, uri, lwt, hex, astring,
                      crc, fmt, rresult
 
