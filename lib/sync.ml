@@ -493,60 +493,75 @@ module Make (IO: IO) (Store: Store.S) = struct
 
     include Listing
 
-    let input ic protocol =
-      Log.debug (fun l -> l "Listing.input (protocol=%a)" pp_protocol protocol);
-      let error fmt = error ("[SMART-HTTP] Listing.input:" ^^ fmt) in
-      let skip_smart_http () =
-        match protocol with
-        | `Git | `SSH -> Lwt.return_unit
-        | `Smart_HTTP ->
-          PacketLine.input ic >>= function
-          | None      -> error "missing # header."
-          | Some line ->
-            match String.cut line ~sep:Misc.sp_str with
-            | Some ("#", service) ->
-              Log.debug (fun l -> l "skipping %s" service);
-              begin PacketLine.input ic >>= function
-                | None   -> Lwt.return_unit
-                | Some x -> error "waiting for pkt-flush, got %S" x
-              end
-            | Some _ -> error "waiting for # header, got %S" line
-            | None   -> error "waiting for # header, got pkt-flush"
-      in
-      let rec aux acc =
-        PacketLine.input ic >>= function
-        | None      -> Lwt.return acc
-        | Some line ->
-          match String.cut line ~sep:Misc.sp_str with
-          | Some ("ERR", err) -> error "ERROR: %s" err
-          | Some (h, r)  ->
-            let h = Hash_IO.Commit.of_hex h in
-            if is_empty acc then (
-              (* Read the capabilities on the first line *)
-              match String.cut r ~sep:Misc.nul_str with
-              | Some (r, caps) ->
-                let r = Reference.of_raw r in
-                let h = Hash.of_commit h in
-                let hashes = Hash.Map.add_multi h r acc.hashes in
-                let references = Reference.Map.add r h acc.references in
-                let capabilities = Capabilities.of_string caps in
-                aux { hashes; capabilities; references }
-              | None ->
-                let r = Reference.of_raw r in
-                let h = Hash.of_commit h in
-                let hashes = Hash.Map.add_multi h r acc.hashes in
-                let references = Reference.Map.add r h acc.references in
-                aux { hashes; references; capabilities = [] }
-            ) else
+    type state =
+      | HeaderService
+      | HeaderFlush
+      | Read of Listing.t
+      | Return of Listing.t
+
+    let error fmt =
+      Fmt.kstrf
+        (fun str -> Error str)
+        ("[SMART-HTTP] Listing.input:" ^^ fmt)
+
+    let handle state line =
+      match state, line with
+      | HeaderService, None   -> error "missing # header."
+      | HeaderService, Some l ->
+        begin match String.cut l ~sep:Misc.sp_str with
+          | Some ("#", service) ->
+            Log.debug (fun l -> l "skipping %s" service);
+            Ok (HeaderFlush, [])
+          | Some _ -> error "waiting for # header, got %S" l
+          | None   -> error "waiting for # header, got pkt-flush"
+        end
+      | HeaderFlush, None   -> Ok (Read Listing.empty, [])
+      | HeaderFlush, Some x -> error "waiting for pkt-flush, got %S" x
+      | Return _   , _      -> error "listing in final state"
+      | Read acc   , None   -> Ok (Return acc, [])
+      | Read acc   , Some l ->
+        match String.cut l ~sep:Misc.sp_str with
+        | Some ("ERR", err) -> error "ERROR: %s" err
+        | Some (h, r)  ->
+          let h = Hash_IO.Commit.of_hex h in
+          if is_empty acc then (
+            (* Read the capabilities on the first line *)
+            match String.cut r ~sep:Misc.nul_str with
+            | Some (r, caps) ->
               let r = Reference.of_raw r in
               let h = Hash.of_commit h in
               let hashes = Hash.Map.add_multi h r acc.hashes in
               let references = Reference.Map.add r h acc.references in
-              aux { acc with hashes; references }
-          | None -> error "Listing.input: %S is not a valid answer" line
+              let capabilities = Capabilities.of_string caps in
+              Ok (Read { hashes; capabilities; references }, [])
+            | None ->
+              let r = Reference.of_raw r in
+              let h = Hash.of_commit h in
+              let hashes = Hash.Map.add_multi h r acc.hashes in
+              let references = Reference.Map.add r h acc.references in
+              Ok (Read { hashes; references; capabilities = [] }, [])
+          ) else
+            let r = Reference.of_raw r in
+            let h = Hash.of_commit h in
+            let hashes = Hash.Map.add_multi h r acc.hashes in
+            let references = Reference.Map.add r h acc.references in
+            Ok (Read { acc with hashes; references }, [])
+        | None -> error "Listing.input: %S is not a valid answer" l
+
+    let input ic protocol =
+      Log.debug (fun l -> l "Listing.input (protocol=%a)" pp_protocol protocol);
+      let init = match protocol with
+        | `Git | `SSH -> Read Listing.empty
+        | `Smart_HTTP -> HeaderService
       in
-      skip_smart_http () >>= fun () ->
-      aux empty
+      let rec aux state =
+        PacketLine.input ic >>= fun line ->
+        match handle state line  with
+        | Ok (Return f, _) -> Lwt.return f
+        | Ok (state   , _) -> aux state
+        | Error e          -> Lwt.fail_with e
+      in
+      aux init
 
   end
 
