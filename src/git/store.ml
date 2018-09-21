@@ -642,14 +642,24 @@ struct
       Log.debug (fun l -> l "Saving pack stream to %a." Fpath.pp path) ;
       let chunk = ref None in
       let call = ref 0 in
+      let closed = ref false in
+      let close msg =
+        Log.debug (fun l -> l "XXX close %a: %s" Fpath.pp path msg);
+        if !closed then Lwt.return ()
+        else (
+          FS.File.close fd
+          >>= function
+          | Error err ->
+            Log.debug (fun l -> l "XXX can't close");
+            Lwt.fail (Save Error.(FS.err_close path err))
+          | Ok ()     ->
+            closed := true;
+            Lwt.return ())
+      in
       let stream () =
         Lwt_stream.peek stream
         >>= function
-        | None -> (
-            FS.File.close fd
-            >>= function
-            | Error err -> Lwt.fail (Save Error.(FS.err_close path err))
-            | Ok () -> Lwt.return_none )
+        | None -> close "peek" >|= fun () -> None
         | Some raw -> (
             let off, len =
               match !chunk with
@@ -658,16 +668,19 @@ struct
             in
             FS.File.write raw ~off ~len fd
             >>= function
-            | Error err -> Lwt.fail (Save Error.(FS.err_write path err))
+            | Error err ->
+                close "write" >>= fun () ->
+                Lwt.fail (Save Error.(FS.err_write path err))
             | Ok 0 when !call = limit ->
+                close "limit" >>= fun () ->
                 Lwt.fail (Save Error.(FS.err_stack path))
             | Ok 0 ->
                 incr call ;
                 Lwt.return_some (Cstruct.sub raw off 0)
             | Ok n ->
                 if n = len then
-                  Lwt_stream.junk stream
-                  >>= fun () -> Lwt.return_some (Cstruct.sub raw off n)
+                  Lwt_stream.junk stream >|= fun () ->
+                  Some (Cstruct.sub raw off n)
                 else (
                   chunk := Some (off + n, len - n) ;
                   Lwt.return_some (Cstruct.sub raw off n) ) )
@@ -717,6 +730,8 @@ struct
           PInfo.first_pass ~ztmp ~window stream
           >>!= (fun err -> `Pack_info err)
           >>?= fun info ->
+          stream () >>= fun b ->
+          Log.debug (fun l -> l "XXX 42 %b" (b = None));
           PackImpl.add ~root:t.dotgit ~read_loose:(read_loose t) ~ztmp ~window
             t.fs t.allocation t.engine path_tmp info
           >>!= lift_error )

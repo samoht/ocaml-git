@@ -96,13 +96,17 @@ module Make0 (Source : SOURCE) (Store : S) = struct
     Store.v root
     >!= store_err
     >?= fun t ->
+    Logs.debug (fun l -> l "XXX 1");
     let stream = stream_of_file Source.pack in
+    Logs.debug (fun l -> l "XXX 2");
     Store.Pack.from t stream
     >!= store_err
     >?= fun _ ->
+    Logs.debug (fun l -> l "XXX 3");
     Store.list t
     >>= fun hashes ->
     let hashes' = hashes_of_pack Source.idx in
+    Logs.debug (fun l -> l "XXX 4");
     let () = Common.assert_keys_equal "import" hashes hashes' in
     Lwt.return (Ok t)
 

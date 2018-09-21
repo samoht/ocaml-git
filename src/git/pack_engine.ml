@@ -729,9 +729,12 @@ struct
       (* XXX(dinosaure): as argument? *)
       let path = Fpath.(root / "objects" / "pack" / file) in
       let temp_dir = Fpath.(root / "tmp") in
+      Log.debug (fun l -> l "XXX store_idx_file 1");
       EIDX.to_file fs ~temp_dir path raw encoder_idx
       >|= function
-      | Ok () -> Ok ()
+      | Ok () ->
+        Log.debug (fun l -> l "XXX store_idx_file 2");
+        Ok ()
       | Error (`Encoder err) -> Error (`Idx_encoder err)
       | Error #fs_error as err -> err
 
@@ -779,6 +782,7 @@ struct
       >>= function
       | Error _ as err -> Lwt.return err
       | Ok () ->
+        Logs.debug (fun l -> l "XXX of_normalized 1");
           let info =
             PInfo.resolve
               ~length:(Hashtbl.length normalized.Normalized.info.PInfo.delta)
@@ -831,10 +835,12 @@ struct
             in
             store_idx_file ~root fs sequence info.PInfo.hash_pack
             >>?= fun () ->
+            Logs.debug (fun l -> l "XXX of_normalized 2");
             FS.File.move fs normalized.Normalized.path path
             >|= Rresult.R.reword_error
                   (Error.FS.err_move normalized.Normalized.path path)
             >>?= fun () ->
+            Logs.debug (fun l -> l "XXX of_normalized 3");
             FS.Mapper.close normalized.Normalized.fd
             >|= Rresult.R.reword_error
                   (Error.FS.err_close normalized.Normalized.path)
@@ -1569,11 +1575,17 @@ struct
       read_and_exclude ~root ~read_loose fs t [info.PInfo.hash_pack]
     in
     let read_inflated = read_and_exclude in
+    Logs.debug (fun l -> l "XXX add 1");
     Normalized.of_info ~read_and_exclude fs path_tmp info
-    >>?= Resolved.of_normalized ~root ~read_and_exclude ~ztmp ~window fs r
-    >>?= Total.of_resolved ~root ~ztmp ~window ~read_inflated fs r
+    >>?= fun x ->
+    Logs.debug (fun l -> l "XXX add 2");
+    Resolved.of_normalized ~root ~read_and_exclude ~ztmp ~window fs r x
+    >>?= fun x ->
+    Logs.debug (fun l -> l "XXX add 3");
+    Total.of_resolved ~root ~ztmp ~window ~read_inflated fs r x
     >>= function
     | Ok total ->
+        Logs.debug (fun l -> l "XXX add 4");
         Hashtbl.replace t.packs total.Total.hash_pack (Total total) ;
         Lwt.return_ok (total.Total.hash_pack, Hashtbl.length total.Total.index)
     | Error _ as err -> Lwt.return err

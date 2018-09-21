@@ -665,6 +665,7 @@ module FS (FS : S.FS) = struct
       >>= function
       | Error _ as err -> Lwt.return err
       | Ok x -> (
+          Log.debug (fun l -> l "XXX with_open_w");
           FS.File.move t temp path
           >|= function
           | Error err -> Error.(v @@ FS.err_move temp path err) | Ok () -> Ok x
